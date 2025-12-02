@@ -1,0 +1,51 @@
+##############################################################
+# 
+# Copyright (C) 2021-2021 Intel Corporation.
+# SPDX-License-Identifier: MIT
+# 
+##############################################################
+#
+# This file includes all the test targets as well as all the
+# non-default build rules and test recipes.
+#
+##############################################################
+
+
+##############################################################
+#
+# Test targets
+#
+##############################################################
+
+###### Place all generic definitions here ######
+
+# Define the SDE example pin tools to build
+PB2ELF := $(PINBALL2ELF)
+DCFG := ../Profiler/DCFG/
+SDE_TOOLS := 
+PINPLAY_TOOLS := global_event_icounter
+
+TOOL_ROOTS := $(SDE_TOOLS) $(PINPLAY_TOOLS)
+
+##############################################################
+#
+# Build rules
+#
+##############################################################
+
+# See makefile.default.rules for the default build rules.
+TOOL_CXXFLAGS := -I$(SDE_ROOT)/include $(TOOL_CXXFLAGS)
+TOOL_CXXFLAGS += -DSDE_INIT -DPINPLAY -I$(PINPLAY_ROOT)/include -I ../RegionControllers/PCcount  -I../RegionControllers/Icount -I$(PB2ELF)/pintools/PinballSYSState/ -I$(DCFG)
+
+ifeq ($(OS),Windows_NT)
+TOOL_LPATHS += /LIBPATH:$(SDE_ROOT)/lib/$(TARGET) /LIBPATH:$(PINPLAY_ROOT)/$(TARGET)
+TOOL_LPATHS += libpinplay.lib libsde.lib bz2.lib zlib.lib
+else
+# sde and pinplay libraries appears twice to avoid circular dependency
+TOOL_LPATHS += -L$(SDE_ROOT)/lib/$(TARGET) -L$(PINPLAY_ROOT)/$(TARGET)
+TOOL_LPATHS += -lpinplay -lsde -lpinplay -lsde -lbz2 -lzlib
+endif
+
+build: obj-$(TARGET)/global_event_icounter.so
+	cp obj-$(TARGET)/global_event_icounter.so $(SDE_BUILD_KIT)/$(TARGET)/sde-global-event-icounter.so
+

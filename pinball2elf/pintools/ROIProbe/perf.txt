@@ -1,0 +1,8 @@
+RTN ROI start: TSC 691176182673
+hw_cpu_cycles:72363500 hw_instructions:157273942 sw_cpu_clock:39573499 
+------------------------------------------------
+Simulation end: TSC 691176662143
+	Sim-end-deltaicount (input)10000
+hw_cpu_cycles:72394270 hw_instructions:157293910 sw_cpu_clock:39656852 
+------------------------------------------------
+Thread end: TSC 691176930063

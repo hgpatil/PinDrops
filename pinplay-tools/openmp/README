@@ -1,0 +1,33 @@
+See LICENSE.dotproduct-omp and  LICENSE.scripts
+=============================================
+setenv SDE_BUILD_KIT <path to SDE 9.*>
+
+Copy ../pinplay-scripts to $SDE_BUILD_KIT/
+Add 'simpoint' binary to $SDE_BUILD_KIT/pinplay-scripts/PinPointsHome
+ [ see ../pinplay-scripts/README.simpoint ]
+
+#make sure all the looppoint tools are built:
+cd  ../GlobalLoopPoint/
+./sde-build-GlobalLoopPoint.sh
+
+# Back to this directory
+cd -
+make
+./sde-run.looppoint.global_looppoint.concat.filter.flowcontrol.sh
+...
+# this should end in messages of this form:
+ replaying dotproduct.1_79259.pp/dotproduct.1_79259_1
+ replaying dotproduct.1_79259.pp/dotproduct.1_79259_2
+ replaying dotproduct.1_79259.pp/dotproduct.1_79259_3
+ replaying dotproduct.1_79259.pp/dotproduct.1_79259_4
+
+
+# To run single-threaded PinPoints, see ../PinPoints/README.md
+ cd $SDE_BUILD_KIT/pinkit/sde-example/example
+ make TARGET=ia32 clean;  make TARGET=ia32
+ make TARGET=intel64 clean;  make TARGET=intel64
+ cp obj-ia32/pcregions_control.so $SDE_BUILD_KIT/ia32
+ cp obj-intel64/pcregions_control.so $SDE_BUILD_KIT/intel64
+ make clean; make
+ sde-run.pinpoints.single-threaded.sh
+

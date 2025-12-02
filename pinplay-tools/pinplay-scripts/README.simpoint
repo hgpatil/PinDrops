@@ -1,0 +1,4 @@
+Automatic download and installation of SimPoint 3.2 needed.
+
+cd  PinPointsHome/Linux/bin/
+make
