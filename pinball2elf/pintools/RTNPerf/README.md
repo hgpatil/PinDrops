@@ -79,6 +79,24 @@ nm mojo.out | grep "::foo"
 # Output: test-symdebug::foo(::List[::Int]&,::Int,::List[::Int]&,::List[::Int]&)
 ```
 
+## Limitations
+
+### Cannot probe [vdso] functions
+Functions in `[vdso]` (Virtual Dynamic Shared Object) cannot be profiled with RTNPerf. The vDSO is a special kernel-mapped memory region designed for ultra-fast system calls (like `clock_gettime`) and does not support Pin's probe insertion.
+
+If you see a function from `[vdso]` as a top procedure in ProcCount output, you cannot profile it with RTNPerf:
+```
+clock_gettime    [vdso]    0x7fff...    5312    421736   # Cannot be probed
+```
+
+**Workaround:** Profile functions from regular shared libraries or your binary instead.
+
+### Probe insertion failures
+Some functions may be too small or have incompatible instruction sequences for probe insertion. RTNPerf will print a warning:
+```
+WARNING: Cannot insert probe at <function_name>
+```
+
 ## Building
 
 ```bash
