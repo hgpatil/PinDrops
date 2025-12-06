@@ -19,7 +19,7 @@
 #include <fcntl.h>           
 #include <sys/stat.h>
 #include "pin.H"
-#include "atomic.hpp"
+// Replaced atomic.hpp with GCC built-in atomics
 
 using std::cerr;
 using std::dec;
@@ -60,17 +60,15 @@ RTN_COUNT *OtherRC = NULL;
 // This function is called before every instruction is executed
 VOID docount(UINT64* counterptr, UINT32 value) 
 {
-ATOMIC::OPS::Increment<UINT64>
- (counterptr, value);
+    __sync_fetch_and_add(counterptr, value);
 }
 VOID docount_tid0(THREADID tid, char * rtnname,  UINT64* counterptr, UINT32 value) 
 {
   if(tid==0)
   {
-  ATOMIC::OPS::Increment<UINT64>
-  (counterptr, value);
-  if(strcmp(rtnname,"floorf") == 0)
-   outFile << "Incrementing for " << rtnname << endl;
+    __sync_fetch_and_add(counterptr, value);
+    if(strcmp(rtnname,"floorf") == 0)
+      outFile << "Incrementing for " << rtnname << endl;
   }
 }
 //{ (*counterptr) += value; }
