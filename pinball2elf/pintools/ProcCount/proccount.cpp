@@ -37,6 +37,11 @@ using std::string;
 
 KNOB<string> KnobOutDir(KNOB_MODE_WRITEONCE, "pintool", "outdir", ".", "Output directory");
 KNOB<string> KnobMsg(KNOB_MODE_WRITEONCE, "pintool", "msgfile", "msg.out", "tool messages");
+KNOB<BOOL> KnobProbeMode(KNOB_MODE_WRITEONCE, "pintool", "probemode", "0", "Use probe mode (faster; RTN counts only, Instructions column = static ins count). Use with Pin's -probe.");
+KNOB<UINT32> KnobProbeMinIns(KNOB_MODE_WRITEONCE, "pintool", "probe_min_ins", "5", "In probe mode: only instrument RTNs with at least this many instructions (avoids WriteProbe assertion)");
+KNOB<UINT32> KnobProbeMaxRtns(KNOB_MODE_WRITEONCE, "pintool", "probe_max_rtns", "0", "In probe mode: max RTNs to probe per process (0 = unlimited). Lowers code cache use.");
+KNOB<BOOL> KnobProbeMainOnly(KNOB_MODE_WRITEONCE, "pintool", "probe_main_only", "0", "In probe mode: only instrument the main executable image (skip shared libs). Lowers code cache use.");
+KNOB<string> KnobProbeImage(KNOB_MODE_WRITEONCE, "pintool", "probe_image", "", "In probe mode: only instrument images whose path contains this substring (e.g. 'pipelines' to skip shell). Empty = no filter.");
 // Absolute outdir (set in main) so execve appends go to the right place even if cwd changes
 static std::string AbsOutDir;
 
@@ -80,6 +85,7 @@ KNOB<string> KnobToolPath(KNOB_MODE_WRITEONCE, "pintool", "tool_path", "", "Tool
 ofstream outFile;
 ofstream msgFile;
 BOOL proc_fini_called = FALSE;
+static pid_t outFilePid = (pid_t)-1;  // pid for which outFile was opened (so we reopen after exec in probe mode)
 
 // Holds instruction count for a single procedure
 typedef struct RtnCount
@@ -89,7 +95,8 @@ typedef struct RtnCount
     ADDRINT _address;
     RTN _rtn;
     UINT64 _rtnCount;
-    UINT64 _icount;
+    UINT64 _icount;       // dynamic instruction count (JIT mode only)
+    UINT64 _staticIcount; // static instruction count (RTN_NumIns); in probe mode used for Instructions column
     struct RtnCount* _next;
 } RTN_COUNT;
 
@@ -135,6 +142,7 @@ VOID InitOtherRoutine()
     OtherRC->_image    = "NOIMAGE";
     OtherRC->_address  = 0;
     OtherRC->_icount   = 0;
+    OtherRC->_staticIcount = 0;
     OtherRC->_rtnCount = 0;
 }
 
@@ -152,6 +160,7 @@ VOID Routine(RTN rtn, VOID* v)
       rc->_image    = StripPath(IMG_Name(SEC_Img(RTN_Sec(rtn))).c_str());
       rc->_address  = RTN_Address(rtn);
       rc->_icount   = 0;
+      rc->_staticIcount = RTN_NumIns(rtn);
       rc->_rtnCount = 0;
 
       // Add to list of routines
@@ -204,13 +213,25 @@ VOID Trace(TRACE trace, VOID* v)
     }
 }
 
+// Truncate for display so lines stay short (avoids vi/editor "long line" red highlight).
+static string truncateForDisplay(const string& s, size_t maxLen)
+{
+  if (s.size() <= maxLen) return s;
+  return s.substr(0, maxLen - 3) + "...";
+}
+
 VOID OutPut(RTN_COUNT *rc)
 {
-  // UNDECORATION_NAME_ONLY
-  // UNDECORATION_COMPLETE
-  if (rc->_icount > 0)
-    outFile << PIN_UndecorateSymbolName(rc->_name, UNDECORATION_NAME_ONLY)<< "#\t" << rc->_image << "#\t0x" << hex << rc->_address << dec
-             << "#\t" << rc->_rtnCount << "#\t" << rc->_icount << endl;
+  // In JIT mode print when we have dynamic icount; in probe mode print when we have RTN calls (Instructions = static count).
+  BOOL probe = KnobProbeMode.Value();
+  UINT64 insCol = probe ? rc->_staticIcount : rc->_icount;
+  if (rc->_icount > 0 || (probe && rc->_rtnCount > 0))
+  {
+    string name = truncateForDisplay(PIN_UndecorateSymbolName(rc->_name, UNDECORATION_NAME_ONLY), 96);
+    string image = truncateForDisplay(rc->_image, 64);
+    outFile << name << "#\t" << image << "#\t0x" << hex << rc->_address << dec
+            << "#\t" << rc->_rtnCount << "#\t" << insCol << endl;
+  }
 }
 
 VOID OutputProcCount()
@@ -219,7 +240,7 @@ VOID OutputProcCount()
             << "Image#\t"
             << "Address#\t"
             << "Calls#\t"
-            << "Instructions" << endl;
+            << (KnobProbeMode.Value() ? "Instructions(static)" : "Instructions") << endl;
 
     OutPut(OtherRC);
     for (RTN_COUNT* rc = RtnList; rc; rc = rc->_next)
@@ -232,10 +253,29 @@ VOID OutputProcCount()
 PIN_LOCK pinLock;
 
 /* ===================================================================== */
-/* Forward declarations                                                  */
+/* Forward declarations (needed for probe-mode exit replacement)          */
 /* ===================================================================== */
-
 VOID ProcStart(pid_t pid);
+VOID ProcFini();
+
+/* ===================================================================== */
+/* Probe mode: PIN_AddFiniFunction is not called; replace exit/_exit so   */
+/* we dump stats before process exits.                                   */
+/* ===================================================================== */
+typedef void (*exit_func_t)(int);
+static exit_func_t orig_exit_ptr = NULL;
+static exit_func_t orig__exit_ptr = NULL;
+
+static void ExitInProbeMode_exit(int s)
+{
+    ProcFini();
+    if (orig_exit_ptr) orig_exit_ptr(s);
+}
+static void ExitInProbeMode__exit(int s)
+{
+    ProcFini();
+    if (orig__exit_ptr) orig__exit_ptr(s);
+}
 
 /* ===================================================================== */
 /* On Linux, exec-ed process may not get OnSyscallExit(execve); ensure   */
@@ -244,12 +284,88 @@ VOID ProcStart(pid_t pid);
 VOID ImageLoad(IMG img, VOID* v)
 {
     if (!IMG_IsMainExecutable(img)) return;
-    if (outFile.is_open()) return;  // Already initialized (e.g. from OnSyscallExit or main)
-    PIN_GetLock(&pinLock, PIN_GetPid());
-    msgFile << "TOOL: ImageLoad(main) ProcStart fallback: pid=" << PIN_GetPid() << " " << IMG_Name(img) << endl;
+    pid_t pid = PIN_GetPid();
+    // Reopen for new pid after exec (probe mode has no OnSyscallExit(execve), so we only have this fallback).
+    if (outFile.is_open() && pid == outFilePid) return;  // Already correct file for this process
+    ProcStart(pid);  // reopen outFile and msgFile for this pid
+    PIN_GetLock(&pinLock, pid);
+    msgFile << "TOOL: ImageLoad(main) ProcStart fallback: pid=" << pid << " " << IMG_Name(img) << endl;
     msgFile.flush();
     PIN_ReleaseLock(&pinLock);
-    ProcStart(PIN_GetPid());
+}
+
+/* ===================================================================== */
+/* Probe mode: instrument every RTN with a probe to count calls; replace */
+/* exit/_exit so we dump stats. No TRACE in probe mode so no icount.     */
+/* ===================================================================== */
+VOID docount_probe(void* counterptr, UINT32 value)
+{
+    __sync_fetch_and_add((UINT64*)counterptr, value);
+}
+
+// In probe mode, number of RTNs we have already probed (for probe_max_rtns cap).
+static UINT32 probeRtnCount = 0;
+
+VOID ImageLoadProbeRtn(IMG img, VOID* v)
+{
+    string imgName = IMG_Name(img);
+    // vdso and similar cannot be probed; skip to avoid WriteProbe assertion.
+    if (imgName.find("[vdso]") != string::npos || imgName.find("vdso") != string::npos)
+        return;
+    if (KnobProbeMainOnly.Value() && !IMG_IsMainExecutable(img))
+        return;  // only instrument main executable
+    const string& probeImageSubstr = KnobProbeImage.Value();
+    if (!probeImageSubstr.empty() && imgName.find(probeImageSubstr) == string::npos)
+        return;  // only instrument images whose path contains this substring (e.g. skip shell, instrument real app)
+    UINT32 minIns = KnobProbeMinIns.Value();
+    UINT32 maxRtns = KnobProbeMaxRtns.Value();
+    for (SEC sec = IMG_SecHead(img); SEC_Valid(sec); sec = SEC_Next(sec))
+    {
+        for (RTN rtn = SEC_RtnHead(sec); RTN_Valid(rtn); rtn = RTN_Next(rtn))
+        {
+            if (RTN_NumIns(rtn) < minIns)
+                continue;  // tiny RTNs often cause WriteProbe assertion
+            string rtnName = RTN_Name(rtn);
+            if (rtnName == "_exit" || rtnName == "exit")
+            {
+                if (!RTN_IsSafeForProbedInsertion(rtn)) continue;
+                PROTO exit_proto = PROTO_Allocate(PIN_PARG(void), CALLINGSTD_DEFAULT, "exit", PIN_PARG(int), PIN_PARG_END());
+                if (rtnName == "_exit")
+                {
+                    orig__exit_ptr = (exit_func_t)RTN_ReplaceSignatureProbed(rtn, (AFUNPTR)ExitInProbeMode__exit,
+                        IARG_PROTOTYPE, exit_proto, IARG_ORIG_FUNCPTR, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
+                }
+                else
+                {
+                    orig_exit_ptr = (exit_func_t)RTN_ReplaceSignatureProbed(rtn, (AFUNPTR)ExitInProbeMode_exit,
+                        IARG_PROTOTYPE, exit_proto, IARG_ORIG_FUNCPTR, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
+                }
+                PROTO_Free(exit_proto);
+                continue;
+            }
+            if (RtnNameMap.find(rtnName) != RtnNameMap.end()) continue;
+            // Only add and instrument RTNs that are safe for probed insertion (required before InsertCallProbed).
+            if (!RTN_IsSafeForProbedInsertion(rtn)) continue;
+            if (maxRtns != 0 && probeRtnCount >= maxRtns)
+                continue;  // cap total probed RTNs to limit code cache use
+            RTN_COUNT* rc = new RTN_COUNT;
+            rc->_name = rtnName;
+            rc->_image = StripPath(imgName.c_str());
+            rc->_address = RTN_Address(rtn);
+            rc->_rtn = rtn;  // not used in probe path
+            rc->_rtnCount = 0;
+            rc->_icount = 0;
+            rc->_staticIcount = RTN_NumIns(rtn);
+            rc->_next = RtnList;
+            RtnList = rc;
+            RtnNameMap[rtnName] = rc;
+            PROTO docount_proto = PROTO_Allocate(PIN_PARG(void), CALLINGSTD_DEFAULT, "docount_probe", PIN_PARG(void*), PIN_PARG(UINT32), PIN_PARG_END());
+            RTN_InsertCallProbed(rtn, IPOINT_BEFORE, (AFUNPTR)docount_probe, IARG_PROTOTYPE, docount_proto,
+                IARG_PTR, &(rc->_rtnCount), IARG_UINT32, 1, IARG_END);
+            PROTO_Free(docount_proto);
+            probeRtnCount++;
+        }
+    }
 }
 
 VOID ProcFini()
@@ -357,17 +473,75 @@ VOID ProcStart(pid_t pid)
     sprintf(outFileName, "/proccount.%d.out", pid);    
     string outdir = KnobOutDir.Value();
     //cerr << "outFileName " << (outdir+outFileName).c_str() << endl;
-    if (outFile.is_open()) outFile.close(); // Might have inherited from the parent...
+    if (outFile.is_open()) outFile.close(); // Might have inherited from parent or wrong pid after exec
     outFile.open((outdir+outFileName).c_str(),  std::ofstream::out | std::ofstream::app);
     if(!outFile)
       cerr << "Failed to open outFileName " << (outdir+outFileName).c_str() << " errno " << std::strerror(errno) << endl;
-        
+    outFilePid = pid;
+    // After exec (e.g. in probe mode) msgFile may still be the old process's; reopen for this pid.
+    std::string od = get_outdir();
+    std::string msgPath = od + "msg." + std::to_string(static_cast<unsigned long>(pid)) + ".txt";
+    msgFile.close();
+    msgFile.open(msgPath, std::ofstream::out | std::ofstream::app);
     // Note: Syscall functions are registered once in main(), not per-process
     atexit(ProcFini);
     PIN_ReleaseLock(&pinLock);
 }
 
 /* ===================================================================== */
+
+/* ===================================================================== */
+/* Follow child/exec-ed process: return TRUE to instrument it (used with */
+/* -follow_execv). Optionally set pin/tool command line via -pin_path,   */
+/* -tool_path so the child is run with the same tool.                    */
+/* ===================================================================== */
+BOOL FollowChild(CHILD_PROCESS cProcess, VOID* val)
+{
+    (void)val;
+    if (KnobPinPath.Value().empty() || KnobToolPath.Value().empty())
+        return TRUE;
+    INT argc = 0;
+    const CHAR* const* argv = NULL;
+    CHILD_PROCESS_GetCommandLine(cProcess, &argc, &argv);
+    // Build new command: pin -probe -follow_execv -t tool ...
+    std::vector<const CHAR*> args;
+    args.push_back(KnobPinPath.Value().c_str());
+    if (PIN_IsProbeMode()) {
+        args.push_back("-probe");  // Pass Pin's -probe so child stays in probe mode across exec
+    }
+    args.push_back("-follow_execv");
+    args.push_back("-t");
+    args.push_back(KnobToolPath.Value().c_str());
+    args.push_back("-outdir");
+    args.push_back(KnobOutDir.Value().c_str());
+    args.push_back("-pin_path");
+    args.push_back(KnobPinPath.Value().c_str());
+    args.push_back("-tool_path");
+    args.push_back(KnobToolPath.Value().c_str());
+    if (KnobProbeMode.Value()) {
+        args.push_back("-probemode"); // tool's flag
+        if (KnobProbeMaxRtns.Value() != 0) {
+            static std::string maxRtnsStr;
+            maxRtnsStr = std::to_string(KnobProbeMaxRtns.Value());
+            args.push_back("-probe_max_rtns");
+            args.push_back(maxRtnsStr.c_str());
+        }
+        if (KnobProbeMainOnly.Value()) {
+            args.push_back("-probe_main_only");
+            args.push_back("1");
+        }
+        if (!KnobProbeImage.Value().empty()) {
+            args.push_back("-probe_image");
+            args.push_back(KnobProbeImage.Value().c_str());
+        }
+    }
+    args.push_back("--");
+    for (INT i = 0; i < argc; i++)
+        args.push_back(argv[i]);
+    args.push_back(NULL);
+    CHILD_PROCESS_SetPinCommandLine(cProcess, (INT)(args.size() - 1), &args[0]);
+    return TRUE;
+}
 
 /* ===================================================================== */
 /* Fork: parent-side callbacks. On Linux, Pin does not run in the       */
@@ -452,7 +626,9 @@ VOID Fini(INT32 code, VOID* v)
 INT32 Usage()
 {
     cerr << "This Pintool counts the number of times a routine is executed" << endl;
-    cerr << "and the number of instructions executed in a routine" << endl;
+    cerr << "and the number of instructions executed in a routine." << endl;
+    cerr << "Use -probemode with Pin's -probe for faster probe mode (RTN counts only; Instructions column = static count)." << endl;
+    cerr << "In probe mode, -probe_max_rtns N, -probe_main_only, -probe_image SUBSTR limit which RTNs are probed (reduces code cache use)." << endl;
     cerr << endl << KNOB_BASE::StringKnobSummary() << endl;
     return -1;
 }
@@ -497,11 +673,15 @@ int main(int argc, char* argv[])
     msgFile.open(msgPath);
     msgFile << "TOOL: main: pid=" << PIN_GetPid() << endl << std::flush;
  
-    // Fork callbacks: parent-side record fork (child not instrumented on Linux);
-    // child-side reinit if Pin ever runs in the child.
-    PIN_AddForkFunction(FPOINT_BEFORE, BeforeForkInParent, 0);
-    PIN_AddForkFunction(FPOINT_AFTER_IN_PARENT, AfterForkInParent, 0);
-    PIN_AddForkFunction(FPOINT_AFTER_IN_CHILD, AfterForkInChild, 0);
+    // Fork and syscall callbacks are JIT-only; do not register in probe mode.
+    if (!KnobProbeMode.Value())
+    {
+        PIN_AddForkFunction(FPOINT_BEFORE, BeforeForkInParent, 0);
+        PIN_AddForkFunction(FPOINT_AFTER_IN_PARENT, AfterForkInParent, 0);
+        PIN_AddForkFunction(FPOINT_AFTER_IN_CHILD, AfterForkInChild, 0);
+        PIN_AddSyscallEntryFunction(OnSyscallEntry, 0);
+        PIN_AddSyscallExitFunction(OnSyscallExit, 0);
+    }
 
     // Ask Pin to inject into child/exec-ed processes (needed to follow pipeline workers).
     PIN_AddFollowChildProcessFunction(FollowChild, 0);
@@ -509,33 +689,43 @@ int main(int argc, char* argv[])
     InitOtherRoutine();
 
     ProcStart(PIN_GetPid()); // Main process starts; use PID for one file per process
-    outFile << "MAIN#" << PIN_GetPid() << "#"; 
+    outFile << "MAIN#" << PIN_GetPid() << "#";
     bool dashseen = false;
-    for (int i=0; i<argc; i++)
+    const INT maxMainArgs = 16;      // limit args so MAIN# line is readable
+    const size_t maxMainLen = 480;   // keep line short so editors (e.g. vi) don't flag as error/long line
+    size_t mainLen = 0;
+    INT mainArgCount = 0;
+    bool truncated = false;
+    for (INT i = 0; i < argc; i++)
     {
-      if(dashseen) outFile << argv[i] << " ";
-      if(strcmp(argv[i],"--") == 0) dashseen=true;
+      if (strcmp(argv[i], "--") == 0) { dashseen = true; continue; }
+      if (!dashseen) continue;
+      size_t argLen = (argv[i] ? strlen(argv[i]) : 0) + 1;
+      if (mainArgCount >= maxMainArgs || mainLen + argLen > maxMainLen) { truncated = true; break; }
+      if (mainArgCount++) outFile << " ";
+      outFile << (argv[i] ? argv[i] : "");
+      mainLen += argLen;
     }
+    if (truncated) outFile << " ... [truncated]";
     outFile << "# 0" << "# 0" << endl;
-
-    // Register syscall entry and exit functions
-    PIN_AddSyscallEntryFunction(OnSyscallEntry, 0);
-    PIN_AddSyscallExitFunction(OnSyscallExit, 0);
+    outFile.flush();
 
     // Fallback: exec-ed process on Linux may not get syscall exit; init on main image load.
     IMG_AddInstrumentFunction(ImageLoad, 0);
 
-    // Register Routine to be called to instrument rtn
-    RTN_AddInstrumentFunction(Routine, 0);
-
-    // Register Trace to be called to instrument trace
-    TRACE_AddInstrumentFunction(Trace, 0);
-
-    // Register Fini to be called when the application exits
-    PIN_AddFiniFunction(Fini, 0);
-
-    // Start the program, never returns
-    PIN_StartProgram();
-
+    if (KnobProbeMode.Value())
+    {
+        // Probe mode: RTN counts only (no trace/icount). Exit replacement dumps stats (Fini not called in probe mode).
+        IMG_AddInstrumentFunction(ImageLoadProbeRtn, 0);
+        PIN_StartProgramProbed();
+    }
+    else
+    {
+        // JIT mode: full RTN count + instruction count per routine
+        RTN_AddInstrumentFunction(Routine, 0);
+        TRACE_AddInstrumentFunction(Trace, 0);
+        PIN_AddFiniFunction(Fini, 0);
+        PIN_StartProgram();
+    }
     return 0;
 }
